@@ -1,0 +1,298 @@
+initialize() {
+    // -------------------------------
+    // Command-line parameters (all must be specified via -d)
+    // -------------------------------
+    defineConstant("REPLICATE", replicate);
+    defineConstant("K_ADAPT", adapt_pop_size);
+    defineConstant("RECOMB_MULTIPLIER", recomb_multiplier);
+    defineConstant("GAMMA_SHAPE", gamma_shape);
+    defineConstant("SEED", seed);
+
+    // -------------------------------
+    // Hard-coded parameters
+    // -------------------------------
+    defineConstant("K_BURNIN", 10000);
+    defineConstant("GAMMA_MEAN", 0.002);
+    defineConstant("BURNIN_OPTIMUM", 5.0);
+    defineConstant("ADAPTATION_OPTIMUM", -5.0);
+    defineConstant("SIGMA_BURNIN", 2.5);
+    defineConstant("SIGMA_ADAPT", 2.5);
+    defineConstant("MARGIN", 0.5);
+    defineConstant("BURN_IN", 30000);
+    defineConstant("MAX_GENS", 300000);
+    defineConstant("SHIFT_DURATION", 1000);
+    defineConstant("GENOME_SIZE", 15570000); // 15.57 Mb
+    defineConstant("RECOMB_FILE", "recomb_rates.tsv");
+
+    cat("Running: Recomb multiplier = " + RECOMB_MULTIPLIER + ", Replicate = " + REPLICATE + "\n");
+    cat("Burn-in pop size = " + K_BURNIN + ", Adapt pop size = " + K_ADAPT + "\n");
+    cat("Gamma DFE: mean=" + GAMMA_MEAN + " shape=" + GAMMA_SHAPE + "\n");
+
+    // -------------------------------
+    // Recombination map
+    // -------------------------------
+    recomb_data = readFile(RECOMB_FILE);
+    if (isNULL(recomb_data)) {
+        stop("ERROR: Could not read recombination file: " + RECOMB_FILE);
+    }
+    recomb_lines = recomb_data[1:(size(recomb_data)-1)];
+    positions = c();
+    rates = c();
+    rates_cM_Mb = c();
+
+    for (line in recomb_lines) {
+        fields = strsplit(line, "\t");
+        start_pos = asInteger(fields[0]);
+        end_pos   = asInteger(fields[1]);
+        rate_cM_Mb = asFloat(fields[2]);
+
+        rate_per_bp = rate_cM_Mb * 1e-8 * RECOMB_MULTIPLIER;
+        positions = c(positions, end_pos);
+        rates = c(rates, rate_per_bp);
+        rates_cM_Mb = c(rates_cM_Mb, rate_cM_Mb * RECOMB_MULTIPLIER);
+    }
+
+    defineConstant("RECOMB_POSITIONS", positions);
+    defineConstant("RECOMB_RATES", rates);
+    defineConstant("RECOMB_RATES_CM_MB", rates_cM_Mb);
+
+    initializeRecombinationRate(rates, positions);
+    cat("Loaded recombination landscape from file\n");
+
+    initializeMutationRate(5e-9);
+
+    // -------------------------------
+    // Mutation types
+    // -------------------------------
+    initializeMutationType("m1", 0.5, "f", 0.0);                          // Neutral
+    initializeMutationType("m2", 0.5, "g", GAMMA_MEAN, GAMMA_SHAPE);      // QTL positive
+    initializeMutationType("m3", 0.5, "g", -GAMMA_MEAN, GAMMA_SHAPE);     // QTL negative
+    m2.convertToSubstitution = F;
+    m3.convertToSubstitution = F;
+
+    initializeGenomicElementType("g1", c(m1, m2, m3), c(0.98, 0.01, 0.01));
+    initializeGenomicElement(g1, 0, GENOME_SIZE - 1);
+
+    // -------------------------------
+    // Output files: one set per parameter combo x replicate,
+    // written into a shared "results" directory. This avoids
+    // multiple concurrent SLURM tasks writing to the same file.
+    // -------------------------------
+    defineConstant("RESULTS_DIR", "results");
+
+    defineConstant("RUN_TAG",
+        "recomb"   + asString(RECOMB_MULTIPLIER) +
+        "_gshape"  + asString(GAMMA_SHAPE) +
+        "_kburnin" + asString(K_BURNIN) +
+        "_kadapt"  + asString(K_ADAPT) +
+        "_rep"     + asString(REPLICATE));
+
+    defineConstant("OVERALL_FILE",    RESULTS_DIR + "/overall_summary_" + RUN_TAG + ".txt");
+    defineConstant("TRAJECTORY_FILE", RESULTS_DIR + "/qtl_trajectories_" + RUN_TAG + ".txt");
+    defineConstant("SUMMARY_FILE",    RESULTS_DIR + "/pop_summary_" + RUN_TAG + ".txt");
+    defineConstant("TRAJECTORY_INTERVAL", 2000);
+
+    // Common parameter prefix for all output lines
+    defineConstant("PARAM_PREFIX",
+        asString(RECOMB_MULTIPLIER) + "\t" +
+        asString(GAMMA_MEAN) + "\t" +
+        asString(GAMMA_SHAPE) + "\t" +
+        asString(K_BURNIN) + "\t" +
+        asString(K_ADAPT) + "\t" +
+        asString(REPLICATE));
+}
+
+// =======================================================
+// QTL fitness effects (they are neutral!)
+// =======================================================
+
+mutationEffect(m2) {
+    return 1.0;
+}
+
+mutationEffect(m3) {
+    return 1.0;
+}
+
+// =======================================================
+// Early event: initialize population and output files
+// =======================================================
+1 early() {
+    sim.addSubpop("p1", K_BURNIN);
+    p1.setValue("current_optimum", BURNIN_OPTIMUM);
+    p1.setValue("burn_in_done", F);
+
+    if (!fileExists(OVERALL_FILE)) {
+        writeFile(OVERALL_FILE, "recomb_multiplier\tgamma_mean\tgamma_shape\tk_burnin\tk_adapt\treplicate\ttotal_qtls\tgenerations_to_adapt\treached_adaptation");
+    }
+    if (!fileExists(TRAJECTORY_FILE)) {
+        writeFile(TRAJECTORY_FILE, "recomb_multiplier\tgamma_mean\tgamma_shape\tk_burnin\tk_adapt\treplicate\tgeneration\tqtl_id\tposition\teffect\trecomb_rate\tfrequency");
+    }
+    if (!fileExists(SUMMARY_FILE)) {
+        writeFile(SUMMARY_FILE, "recomb_multiplier\tgamma_mean\tgamma_shape\tk_burnin\tk_adapt\treplicate\tgeneration\tmean_phenotype\tpi");
+    }
+
+    cat("Initialized population and output files.\n");
+}
+
+// =======================================================
+// Helper functions
+// =======================================================
+
+function (float)getRecombRate(integer pos) {
+    for (i in 0:(size(RECOMB_POSITIONS) - 1)) {
+        if (pos <= RECOMB_POSITIONS[i]) {
+            return RECOMB_RATES_CM_MB[i];
+        }
+    }
+    return RECOMB_RATES_CM_MB[size(RECOMB_RATES_CM_MB) - 1];
+}
+
+function (float)getCurrentOptimum(integer generation) {
+    if (generation <= BURN_IN) {
+        return BURNIN_OPTIMUM;
+    } else if (generation <= BURN_IN + SHIFT_DURATION) {
+        shift_progress = (generation - BURN_IN) / SHIFT_DURATION;
+        return BURNIN_OPTIMUM + shift_progress * (ADAPTATION_OPTIMUM - BURNIN_OPTIMUM);
+    } else {
+        return ADAPTATION_OPTIMUM;
+    }
+}
+
+
+
+// Function to track QTL frequency trajectories and population summary stats
+function (void)writeQTLTrajectories(integer generation) {
+    qtls = c(sim.mutationsOfType(m2), sim.mutationsOfType(m3));
+
+    // Population average phenotype
+    inds = p1.individuals;
+    phenotypes = inds.sumOfMutationsOfType(m2) + inds.sumOfMutationsOfType(m3);
+    mean_pheno = mean(phenotypes);
+
+    // Pi using built-in
+    pi = calcPi(p1.haplosomes);
+
+    // Write population-level summary (one row per generation)
+    summary_line = PARAM_PREFIX + "\t" +
+                   asString(generation) + "\t" +
+                   asString(mean_pheno) + "\t" +
+                   asString(pi);
+    writeFile(SUMMARY_FILE, summary_line, append=T);
+
+    // Write per-QTL trajectories
+    if (size(qtls) > 0) {
+        freqs = sim.mutationFrequencies(p1, qtls);
+
+        for (i in 0:(size(qtls) - 1)) {
+            qtl = qtls[i];
+            pos = qtl.position;
+            effect = qtl.selectionCoeff;
+            recomb_rate = getRecombRate(pos);
+            freq = freqs[i];
+
+            trajectory_line = PARAM_PREFIX + "\t" +
+                             asString(generation) + "\t" +
+                             asString(qtl.id) + "\t" +
+                             asString(pos) + "\t" +
+                             asString(effect) + "\t" +
+                             asString(recomb_rate) + "\t" +
+                             asString(freq);
+            writeFile(TRAJECTORY_FILE, trajectory_line, append=T);
+        }
+    }
+}
+
+// Function to write results to files
+function (void)writeResults(integer generation_reached, logical reached_adaptation) {
+    qtls = c(sim.mutationsOfType(m2), sim.mutationsOfType(m3));
+    n_qtls = size(qtls);
+
+    // Calculate generations to adapt AFTER the shift completed
+    gens_to_adapt = -1;
+    if (reached_adaptation) {
+        gens_to_adapt = generation_reached - BURN_IN - SHIFT_DURATION;
+    }
+
+    // Write overall summary
+    overall_line = PARAM_PREFIX + "\t" +
+                   asString(n_qtls) + "\t" +
+                   asString(gens_to_adapt) + "\t" +
+                   (reached_adaptation ? "TRUE" else "FALSE");
+    writeFile(OVERALL_FILE, overall_line, append=T);
+
+    if (reached_adaptation) {
+        cat("Results written to files. Generations to adapt after shift: " + gens_to_adapt + "\n");
+    } else {
+        cat("Results written to files. Adaptation not reached within " + MAX_GENS + " generations.\n");
+    }
+}
+
+// =======================================================
+// Late event: main simulation loop
+// =======================================================
+1:MAX_GENS late() {
+    inds = p1.individuals;
+    phenotypes = inds.sumOfMutationsOfType(m2) + inds.sumOfMutationsOfType(m3);
+
+    current_opt = getCurrentOptimum(sim.cycle);
+    burn_in_done = p1.getValue("burn_in_done");
+    p1.setValue("current_optimum", current_opt);
+
+    sigma = SIGMA_BURNIN;
+    if (burn_in_done) { sigma = SIGMA_ADAPT; }
+
+    fitness_values = exp(-0.5 * ((phenotypes - current_opt)^2) / (sigma^2));
+    inds.fitnessScaling = fitness_values;
+
+    mean_pheno = mean(phenotypes);
+    var_pheno = var(phenotypes);
+    qtls = c(sim.mutationsOfType(m2), sim.mutationsOfType(m3));
+    n_qtls = size(qtls);
+
+    // periodic logging
+    if (sim.cycle % 2000 == 0) {
+        cat("gen=" + sim.cycle + ", mean pheno=" + mean_pheno + ", current optimum=" + current_opt + ", n_qtls=" + n_qtls + "\n");
+    }
+
+    // Save QTL frequencies at burn-in
+    if (sim.cycle == BURN_IN) {
+        p1.setValue("burn_in_done", T);
+        p1.setSubpopulationSize(K_ADAPT);
+        cat("Population resized from " + K_BURNIN + " to " + K_ADAPT + " at end of burn-in.\n");
+        cat("Burn-in complete at generation " + BURN_IN + "\n");
+
+        // Track trajectories at burn-in
+        writeQTLTrajectories(sim.cycle);
+    }
+
+    // Track QTL trajectories during adaptation
+    if (burn_in_done & (sim.cycle % TRAJECTORY_INTERVAL == 0)) {
+        writeQTLTrajectories(sim.cycle);
+    }
+
+    // Track at shift completion
+    if (sim.cycle == BURN_IN + SHIFT_DURATION) {
+        writeQTLTrajectories(sim.cycle);
+    }
+
+    // check for adaptation completion
+    if (burn_in_done & sim.cycle > BURN_IN + SHIFT_DURATION) {
+        distance_to_opt = abs(mean_pheno - current_opt);
+        if (distance_to_opt < MARGIN) {
+            cat("*** REACHED OPTIMUM AT GENERATION " + sim.cycle + " ***\n");
+            // Final trajectory point
+            writeQTLTrajectories(sim.cycle);
+            writeResults(sim.cycle, T);
+            sim.simulationFinished();
+        }
+    }
+
+    // stop simulation if MAX_GENS reached
+    if (sim.cycle == MAX_GENS) {
+        cat("Simulation ended without reaching optimum\n");
+        writeQTLTrajectories(sim.cycle);
+        writeResults(MAX_GENS, F);
+        sim.simulationFinished();
+    }
+}
